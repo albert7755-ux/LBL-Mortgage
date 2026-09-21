@@ -58,7 +58,8 @@ def build_ladder(principal, rate, draw_ratio, last_draw_ratio, layers):
     return pd.DataFrame(rows), total_position, total_borrow
 
 
-LAYER_NAMES = {0: "原始層", 1: "第一層", 2: "第二層", 3: "第三層", 4: "第四層"}
+LAYER_NAMES = {0: "原始層", 1: "第一層", 2: "第二層", 3: "第三層",
+               4: "第四層", 5: "第五層", 6: "第六層"}
 
 
 def utilization_ratio(total_borrow, collateral, rate, fx_shock=0.0):
@@ -511,26 +512,40 @@ st.sidebar.caption("⚠️ 基金的實際成數常低於債券，建議先與�
 
 fx_discount = st.sidebar.slider("錯幣折扣 (%)", 50, 100, 90, 5) / 100
 utilization = st.sidebar.slider(
-    "額度動用比例 (%)", 50, 100, 90, 5,
-    help="銀行核給額度時的折算係數，屬於額度公式的一部分",
+    "額度動用比例 (%)〔銀行〕", 50, 100, 90, 5,
+    help="銀行額度公式裡的折算係數。調低會同時縮小額度與追繳門檻 → 使用率反而上升",
 ) / 100
 
 draw_ratio = st.sidebar.slider(
-    "每層實際動用額度 (%)", 0, 100, 100, 5,
-    help="除了最後一層以外，每一層實際借出可動用額度的幾成。100% = 借好借滿",
+    "每層實際動用 (%)〔自己決定〕", 0, 100, 100, 5,
+    help="最後一層以外，每層實際借出可動用額度的幾成。調低 → 使用率下降",
 ) / 100
 
 last_draw_ratio = st.sidebar.slider(
-    "最後一層動用額度 (%)", 0, 100, 100, 5,
-    help="設 0% ＝ 最後一層只設質、不動用額度（額度留著當緩衝，使用率下降）",
+    "最後一層動用 (%)〔自己決定〕", 0, 100, 100, 5,
+    help="只作用在每一列的最後一層。設 0% ＝ 只設質、不動用額度",
 ) / 100
 
+with st.sidebar.expander("❓ 三個「動用」差在哪"):
+    st.markdown("""
+| 參數 | 誰決定 | 影響 | 調低的效果 |
+|---|---|---|---|
+| **額度動用比例** | 銀行 | 額度公式的分母，追繳線跟著移動 | 使用率**上升** ⚠️ |
+| **每層實際動用** | 你 | 只影響借多少，追繳線不動 | 使用率**下降** ✅ |
+| **最後一層動用** | 你 | 同上，但只作用在最後一層 | 使用率**下降** ✅ |
+
+銀行把成數調低是**收緊**，不是給你緩衝；自己少借才是緩衝。
+""")
+
 st.sidebar.markdown("**要試算到第幾層**")
-col_ly1, col_ly2 = st.sidebar.columns(2)
-with col_ly1:
-    show_l3 = st.checkbox("第三層", value=True)
-with col_ly2:
-    show_l4 = st.checkbox("第四層", value=False)
+LAYER_DEFAULTS = {1: True, 2: True, 3: True, 4: False, 5: False, 6: False}
+show_layer = {}
+ly_cols = st.sidebar.columns(3)
+for n in range(1, 7):
+    with ly_cols[(n - 1) % 3]:
+        show_layer[n] = st.checkbox(LAYER_NAMES[n], value=LAYER_DEFAULTS[n],
+                                    key=f"layer_{n}")
+st.sidebar.caption("原始層（不借款）一律顯示，作為對照基準")
 
 extra_pledge = st.sidebar.number_input(
     "追加設質（萬元）", min_value=0, max_value=100000, value=0, step=100,
@@ -620,7 +635,7 @@ st.divider()
 # 共用計算
 # ------------------------------------------------------------
 
-layers_list = [0, 1, 2] + ([3] if show_l3 else []) + ([4] if show_l4 else [])
+layers_list = [0] + [n for n in range(1, 7) if show_layer[n]]
 terms = [20, 30]
 
 # 雙因子矩陣的情境匯率：自建倉匯率往下每檔遞減 fx_step
@@ -783,7 +798,12 @@ mc = pd.DataFrame({
     "擔保品（萬）": summary["擔保品"].map(fmt),
     "可動用額度（萬）": summary["可動用額度"].map(fmt),
     "目前使用率": summary["目前使用率"].map(
-        lambda x: f"{'❌' if x >= call_line else '⚠️' if x >= notice_line * 0.9 else '✅'} {x*100:.1f}%"
+        lambda x: (
+            f"❌ {x*100:.1f}%（已達追繳）" if x >= call_line
+            else f"⚠️ {x*100:.1f}%（已達通知）" if x >= notice_line
+            else f"🟡 {x*100:.1f}%" if x >= notice_line * 0.9
+            else f"✅ {x*100:.1f}%"
+        )
     ),
     f"距通知線（{notice_line*100:.0f}%）可跌": [
         drop_cell(x, borrow=b) for x, b in zip(summary["距通知線"], summary["總借款"])
