@@ -34,44 +34,51 @@ def credit_line_rate(w_bond, ltv_bond, w_fund, ltv_fund, fx_discount, utilizatio
     return weighted_ltv * fx_discount * utilization
 
 
-def build_ladder(principal, rate, draw_ratio, rounds):
-    """循環質借階梯。每輪借款 = 該輪買入 × 可動用額度成數 × 實際動用比例"""
-    rows = []
+def build_ladder(principal, rate, draw_ratio, last_draw_ratio, layers):
+    """
+    層次化質借階梯
+      原始層  = 自有本金買入的債券（設質，尚未借款）
+      第 N 層 = 用第 N-1 層的額度借出、買入並設質的債券
+    最後一層可單獨設定動用比例；設 0% 即「只設質、不動用額度」
+    """
+    rows = [{"層次": "原始投入", "買入金額": principal, "質押借出": 0.0}]
     current = principal
     total_position = principal
     total_borrow = 0.0
 
-    for i in range(1, rounds + 1):
-        borrowed = current * rate * draw_ratio
-        rows.append({"輪次": f"第 {i} 輪", "買入金額": current, "質押借出": borrowed})
+    for i in range(1, layers + 1):
+        dr = last_draw_ratio if i == layers else draw_ratio
+        borrowed = current * rate * dr
+        rows.append({"層次": f"第 {i} 層", "買入金額": borrowed, "質押借出": borrowed})
         total_borrow += borrowed
         total_position += borrowed
         current = borrowed
 
-    rows.append({"輪次": "最後投入", "買入金額": current, "質押借出": 0.0})
-    rows.append({"輪次": "合計", "買入金額": total_position, "質押借出": total_borrow})
-
+    rows.append({"層次": "合計", "買入金額": total_position, "質押借出": total_borrow})
     return pd.DataFrame(rows), total_position, total_borrow
 
 
-def utilization_ratio(total_borrow, total_position, rate, fx_shock=0.0):
+LAYER_NAMES = {0: "原始層", 1: "第一層", 2: "第二層", 3: "第三層", 4: "第四層"}
+
+
+def utilization_ratio(total_borrow, collateral, rate, fx_shock=0.0):
     """
     使用率 = 借款 ÷ (擔保品市值 × 可動用額度成數)
     fx_shock：匯率不利變動幅度，直接折損擔保品在貸款幣別下的價值
     """
-    limit = total_position * (1 - fx_shock) * rate
+    limit = collateral * (1 - fx_shock) * rate
     return total_borrow / limit if limit > 0 else 0.0
 
 
-def value_drop_to(total_borrow, total_position, rate, threshold, fx_shock=0.0):
+def value_drop_to(total_borrow, collateral, rate, threshold, fx_shock=0.0):
     """
     在匯率已不利變動 fx_shock 的前提下，擔保品「價格」還能再跌多少才碰到某條線
     觸發條件：借款 = threshold × rate × 部位 × (1-價格跌幅) × (1-匯率跌幅)
     回傳可能為負值，代表已經觸發
     """
-    if rate <= 0 or threshold <= 0 or total_position <= 0 or fx_shock >= 1:
+    if rate <= 0 or threshold <= 0 or collateral <= 0 or fx_shock >= 1:
         return 0.0
-    base = total_borrow / (threshold * rate * total_position)
+    base = total_borrow / (threshold * rate * collateral)
     return 1 - base / (1 - fx_shock)
 
 
@@ -162,8 +169,10 @@ def fx_shock_from_rate(rate_now, rate_base):
     return 1 - rate_now / rate_base
 
 
-def drop_cell(x, with_icon=True):
-    """把「還能跌多少」格式化；負值代表已觸發"""
+def drop_cell(x, with_icon=True, borrow=None):
+    """把「還能跌多少」格式化；負值代表已觸發，無借款則不適用"""
+    if borrow is not None and borrow <= 0:
+        return "♾️ 無借款" if with_icon else "無借款"
     if x <= 0:
         return "❌ 已觸發" if with_icon else "已觸發"
     return f"{ICON[buffer_label(x)]} -{x*100:.1f}%" if with_icon else f"-{x*100:.1f}%"
@@ -280,7 +289,9 @@ def build_pdf(params, summary, terms, font_paths):
         ["錯幣折扣", f"{p['fx_discount']*100:.0f}%", "額度動用比例", f"{p['utilization']*100:.0f}%"],
         ["Lombard 利率", f"{p['lombard_rate']*100:.2f}%", "混合配息率", f"{p['blended_yield']*100:.2f}%"],
         ["可動用額度成數", f"{p['credit_rate']*100:.2f}%",
-         "每輪實際動用", f"{p['draw_ratio']*100:.0f}%"],
+         "每層實際動用", f"{p['draw_ratio']*100:.0f}%"],
+        ["最後一層動用", f"{p['last_draw_ratio']*100:.0f}%",
+         "追加設質", f"{p['extra_pledge']:,} 萬"],
         ["通知線（使用率）", f"{p['notice_line']*100:.0f}%",
          "追繳線（使用率）", f"{p['call_line']*100:.0f}%"],
         [f"建倉匯率（{p['fx_pair']}）", f"{p['fx_base']:.2f}",
@@ -295,11 +306,12 @@ def build_pdf(params, summary, terms, font_paths):
     # ---------- 部位結構 ----------
     section("二、部位結構")
     pos_rows = [
-        [r["借款次數"], fmt(r["總部位"]), fmt(r["總借款"]), f"{r['槓桿倍數']:.2f} 倍"]
+        [r["層次"], fmt(r["總部位"]), fmt(r["總借款"]),
+         fmt(r["擔保品"]), f"{r['槓桿倍數']:.2f} 倍"]
         for _, r in summary.iterrows()
     ]
-    table(["借款次數", "總部位（萬）", "總借款（萬）", "槓桿倍數"], pos_rows,
-          [36, 48, 48, 48], align=["C", "R", "R", "C"])
+    table(["層次", "總部位（萬）", "總借款（萬）", "擔保品（萬）", "槓桿倍數"], pos_rows,
+          [30, 40, 40, 40, 30], align=["C", "R", "R", "R", "C"])
 
     # ---------- 現金流 ----------
     section("三、現金流與房貸覆蓋率" if has_mortgage else "三、現金流與自有資金報酬率")
@@ -313,7 +325,7 @@ def build_pdf(params, summary, terms, font_paths):
         ))
         pdf.ln(1)
 
-    headers = ["借款次數", "年配息", "Lombard年息", "投資端年淨現金流"]
+    headers = ["層次", "年配息", "Lombard年息", "投資端年淨現金流"]
     weights = [22, 20, 24, 30]
     align = ["C", "R", "R", "R"]
     if own_funded:
@@ -327,7 +339,9 @@ def build_pdf(params, summary, terms, font_paths):
 
     cf_rows = []
     for _, r in summary.iterrows():
-        row = [r["借款次數"], fmt(r["年配息"]), "-" + fmt(r["年利息"]), fmt(r["年淨現金流"])]
+        row = [r["層次"], fmt(r["年配息"]),
+               fmt(0) if r["年利息"] <= 0 else "-" + fmt(r["年利息"]),
+               fmt(r["年淨現金流"])]
         if own_funded:
             row.append(f"{r['自有資金報酬率']*100:.2f}%")
         for t in (terms if has_mortgage else []):
@@ -345,13 +359,13 @@ def build_pdf(params, summary, terms, font_paths):
         pdf.cell(0, 6, "打平所需的最低混合配息率", new_x="LMARGIN", new_y="NEXT")
         be_rows = []
         for _, r in summary.iterrows():
-            row = [r["借款次數"]]
+            row = [r["層次"]]
             for t in terms:
                 pay = mortgage_annual_payment(p["mortgage_amount"], p["mortgage_rate"], t)
                 need = (pay + r["總借款"] * p["lombard_rate"]) / r["總部位"] if r["總部位"] else 0
                 row.append(f"{need*100:.2f}%")
             be_rows.append(row)
-        table(["借款次數"] + [f"{t} 年期" for t in terms], be_rows,
+        table(["層次"] + [f"{t} 年期" for t in terms], be_rows,
               [60] + [60] * len(terms))
 
     # ---------- 風險 ----------
@@ -363,15 +377,14 @@ def build_pdf(params, summary, terms, font_paths):
         surv = r["存活年數"]
         surv_text = "不會觸發" if is_never(surv) else f"約 {surv:.0f} 年（{survival_label(surv)}）"
         risk_rows.append([
-            r["借款次數"],
+            r["層次"],
             fmt(r["可動用額度"]),
             f"{r['目前使用率']*100:.1f}%",
-            f"-{r['距通知線']*100:.1f}%" if r["距通知線"] > 0 else "已觸發",
-            f"-{r['距追繳線']*100:.1f}%（{buffer_label(r['距追繳線'])}）"
-            if r["距追繳線"] > 0 else "已觸發",
+            drop_cell(r["距通知線"], with_icon=False, borrow=r["總借款"]),
+            drop_cell(r["距追繳線"], with_icon=False, borrow=r["總借款"]),
             surv_text,
         ])
-    table(["借款次數", "可動用額度（萬）", "目前使用率",
+    table(["層次", "可動用額度（萬）", "目前使用率",
            f"距通知線{p['notice_line']*100:.0f}%", f"距追繳線{p['call_line']*100:.0f}%",
            "淨值侵蝕存活年數"],
           risk_rows, [24, 34, 26, 28, 36, 38], align=["C", "R", "R", "R", "C", "C"])
@@ -390,11 +403,12 @@ def build_pdf(params, summary, terms, font_paths):
              f"{p['fx_pair']} × 債券價格 雙因子："
              f"距追繳線（{p['call_line']*100:.0f}%）債券還能再跌多少",
              new_x="LMARGIN", new_y="NEXT")
-    fx_headers = ["借款次數"] + [
+    fx_headers = ["層次"] + [
         f"{q:.2f}" + ("（建倉）" if abs(q - p["fx_base"]) < 1e-9 else "") for q in scen
     ]
     fx_rows = [
-        [r["借款次數"]] + [drop_cell(r["匯率情境"][q], with_icon=False) for q in scen]
+        [r["層次"]] + [drop_cell(r["匯率情境"][q], with_icon=False, borrow=r["總借款"])
+                      for q in scen]
         for _, r in summary.iterrows()
     ]
     table(fx_headers, fx_rows, [24] + [26] * len(scen),
@@ -502,9 +516,26 @@ utilization = st.sidebar.slider(
 ) / 100
 
 draw_ratio = st.sidebar.slider(
-    "每輪實際動用額度 (%)", 50, 100, 100, 5,
-    help="每一輪實際借出可動用額度的幾成。100% = 借好借滿",
+    "每層實際動用額度 (%)", 0, 100, 100, 5,
+    help="除了最後一層以外，每一層實際借出可動用額度的幾成。100% = 借好借滿",
 ) / 100
+
+last_draw_ratio = st.sidebar.slider(
+    "最後一層動用額度 (%)", 0, 100, 100, 5,
+    help="設 0% ＝ 最後一層只設質、不動用額度（額度留著當緩衝，使用率下降）",
+) / 100
+
+st.sidebar.markdown("**要試算到第幾層**")
+col_ly1, col_ly2 = st.sidebar.columns(2)
+with col_ly1:
+    show_l3 = st.checkbox("第三層", value=True)
+with col_ly2:
+    show_l4 = st.checkbox("第四層", value=False)
+
+extra_pledge = st.sidebar.number_input(
+    "追加設質（萬元）", min_value=0, max_value=100000, value=0, step=100,
+    help="客戶名下其他已持有、額外設質進擔保池的債券。只增加擔保品，不增加借款與配息",
+)
 
 st.sidebar.subheader("4️⃣ 追繳門檻")
 notice_line = st.sidebar.slider("通知線：使用率 (%)", 70, 100, 95, 1) / 100
@@ -589,7 +620,7 @@ st.divider()
 # 共用計算
 # ------------------------------------------------------------
 
-rounds_list = [1, 2, 3, 4]
+layers_list = [0, 1, 2] + ([3] if show_l3 else []) + ([4] if show_l4 else [])
 terms = [20, 30]
 
 # 雙因子矩陣的情境匯率：自建倉匯率往下每檔遞減 fx_step
@@ -598,38 +629,40 @@ fx_scenarios = [round(fx_base - i * fx_step, 4) for i in range(FX_SCENARIO_COUNT
 summary_rows = []
 detail_store = {}
 
-for r in rounds_list:
+for r in layers_list:
     ladder_df, total_position, total_borrow = build_ladder(
-        principal, credit_rate, draw_ratio, r)
+        principal, credit_rate, draw_ratio, last_draw_ratio, r)
     detail_store[r] = ladder_df
+    collateral = total_position + extra_pledge
 
     annual_income = total_position * blended_yield
     annual_interest = total_borrow * lombard_rate
     net_cf = annual_income - annual_interest
     net_cf_stress = annual_income - total_borrow * stress_rate
 
-    util_now = utilization_ratio(total_borrow, total_position, credit_rate, fx_shock)
-    drop_notice = value_drop_to(total_borrow, total_position, credit_rate,
+    util_now = utilization_ratio(total_borrow, collateral, credit_rate, fx_shock)
+    drop_notice = value_drop_to(total_borrow, collateral, credit_rate,
                                 notice_line, fx_shock)
-    drop_call = value_drop_to(total_borrow, total_position, credit_rate,
+    drop_call = value_drop_to(total_borrow, collateral, credit_rate,
                               call_line, fx_shock)
 
     surv = survival_years(
-        total_position * w_bond, total_position * w_fund,
+        collateral * w_bond, collateral * w_fund,
         total_borrow, credit_rate, call_line, fund_decline, fx_shock,
     )
 
     fx_grid = {
-        rate_q: value_drop_to(total_borrow, total_position, credit_rate, call_line,
+        rate_q: value_drop_to(total_borrow, collateral, credit_rate, call_line,
                               fx_shock_from_rate(rate_q, fx_base))
         for rate_q in fx_scenarios
     }
 
     row = {
-        "借款次數": f"借 {r} 次",
+        "層次": LAYER_NAMES[r],
         "總部位": total_position,
         "總借款": total_borrow,
-        "可動用額度": total_position * (1 - fx_shock) * credit_rate,
+        "擔保品": collateral,
+        "可動用額度": collateral * (1 - fx_shock) * credit_rate,
         "槓桿倍數": total_position / principal if principal else 0,
         "年配息": annual_income,
         "年利息": annual_interest,
@@ -659,20 +692,20 @@ summary = pd.DataFrame(summary_rows)
 
 st.subheader("① 部位結構")
 
-pos_df = summary[["借款次數", "總部位", "總借款", "槓桿倍數"]].copy()
+pos_df = summary[["層次", "總部位", "總借款", "槓桿倍數"]].copy()
 pos_df["總部位"] = pos_df["總部位"].map(fmt)
 pos_df["總借款"] = pos_df["總借款"].map(fmt)
 pos_df["槓桿倍數"] = pos_df["槓桿倍數"].map(lambda x: f"{x:.2f} 倍")
-pos_df.columns = ["借款次數", "總部位（萬）", "總借款（萬）", "槓桿倍數"]
+pos_df.columns = ["層次", "總部位（萬）", "總借款（萬）", "槓桿倍數"]
 show_df(pos_df)
 
 with st.expander("📋 查看逐輪明細"):
-    pick = st.radio("選擇借款次數", rounds_list, index=1, horizontal=True,
-                    format_func=lambda x: f"借 {x} 次")
+    pick = st.radio("選擇層次", layers_list, index=min(2, len(layers_list) - 1),
+                    horizontal=True, format_func=lambda x: LAYER_NAMES[x])
     d = detail_store[pick].copy()
     d["買入金額"] = d["買入金額"].map(fmt)
     d["質押借出"] = d["質押借出"].map(fmt)
-    d.columns = ["輪次", "買入金額（萬）", "質押借出（萬）"]
+    d.columns = ["層次", "買入金額（萬）", "質押借出（萬）"]
     show_df(d)
 
 st.divider()
@@ -696,9 +729,9 @@ if has_mortgage:
         )
 
 display = pd.DataFrame({
-    "借款次數": summary["借款次數"],
+    "層次": summary["層次"],
     "年配息（萬）": summary["年配息"].map(fmt),
-    "Lombard年息（萬）": summary["年利息"].map(lambda x: f"-{fmt(x)}"),
+    "Lombard年息（萬）": summary["年利息"].map(lambda x: fmt(0) if x <= 0 else f"-{fmt(x)}"),
     "投資端年淨現金流（未扣房貸）": summary["年淨現金流"].map(fmt),
 })
 if own_funded:
@@ -722,7 +755,7 @@ if has_mortgage:
     st.markdown("**打平所需的最低混合配息率**")
     be_rows = []
     for _, r in summary.iterrows():
-        row = {"借款次數": r["借款次數"]}
+        row = {"層次": r["層次"]}
         for t in terms:
             pay = mortgage_annual_payment(mortgage_amount, mortgage_rate, t)
             need = (pay + r["總借款"] * lombard_rate) / r["總部位"] if r["總部位"] else 0
@@ -745,14 +778,19 @@ st.subheader("③ 風險評估")
 
 st.markdown("**額度使用率與擔保品可跌幅度**")
 mc = pd.DataFrame({
-    "借款次數": summary["借款次數"],
+    "層次": summary["層次"],
     "借款（萬）": summary["總借款"].map(fmt),
+    "擔保品（萬）": summary["擔保品"].map(fmt),
     "可動用額度（萬）": summary["可動用額度"].map(fmt),
     "目前使用率": summary["目前使用率"].map(
         lambda x: f"{'❌' if x >= call_line else '⚠️' if x >= notice_line * 0.9 else '✅'} {x*100:.1f}%"
     ),
-    f"距通知線（{notice_line*100:.0f}%）可跌": summary["距通知線"].map(drop_cell),
-    f"距追繳線（{call_line*100:.0f}%）可跌": summary["距追繳線"].map(drop_cell),
+    f"距通知線（{notice_line*100:.0f}%）可跌": [
+        drop_cell(x, borrow=b) for x, b in zip(summary["距通知線"], summary["總借款"])
+    ],
+    f"距追繳線（{call_line*100:.0f}%）可跌": [
+        drop_cell(x, borrow=b) for x, b in zip(summary["距追繳線"], summary["總借款"])
+    ],
 })
 show_df(mc)
 st.caption(
@@ -766,10 +804,11 @@ st.markdown(
     f"**{fx_pair} × 債券價格 雙因子：距追繳線（{call_line*100:.0f}%）債券還能再跌多少**"
 )
 fx_matrix = pd.DataFrame({
-    "借款次數": summary["借款次數"],
+    "層次": summary["層次"],
     **{
         f"{rate_q:.2f}" + ("（建倉）" if abs(rate_q - fx_base) < 1e-9 else ""):
-            summary["匯率情境"].map(lambda g, k=rate_q: drop_cell(g[k]))
+            [drop_cell(g[rate_q], borrow=b)
+             for g, b in zip(summary["匯率情境"], summary["總借款"])]
         for rate_q in fx_scenarios
     },
 })
@@ -782,7 +821,7 @@ st.caption(
 
 st.markdown(f"**淨值侵蝕存活年數**（基金年跌 {fund_decline*100:.1f}%）")
 sv = pd.DataFrame({
-    "借款次數": summary["借款次數"],
+    "層次": summary["層次"],
     "幾年後碰到追繳線": summary["存活年數"].map(
         lambda x: "♾️ 不會觸發" if is_never(x)
         else f"{ICON[survival_label(x)]} 約 {x:.0f} 年"
@@ -793,7 +832,7 @@ st.caption("假設債券持有到期、僅基金淨值侵蝕")
 
 st.markdown(f"**壓力測試：Lombard 利率升至 {stress_rate*100:.2f}%**")
 stress_display = pd.DataFrame({
-    "借款次數": summary["借款次數"],
+    "層次": summary["層次"],
     "壓力後淨現金流（萬）": summary["壓力淨現金流"].map(fmt),
 })
 if has_mortgage:
@@ -821,16 +860,17 @@ st.divider()
 st.subheader("④ 配息率敏感度")
 
 sens_rounds = st.multiselect(
-    "選擇要比較的借款次數", rounds_list, default=[2, 3],
-    format_func=lambda x: f"借 {x} 次",
+    "選擇要比較的層次", layers_list,
+    default=[x for x in (1, 2) if x in layers_list],
+    format_func=lambda x: LAYER_NAMES[x],
 )
 
 if sens_rounds:
     yields = [i / 100 for i in range(30, 101, 5)]
     chart_data = {}
     for r in sens_rounds:
-        s = summary[summary["借款次數"] == f"借 {r} 次"].iloc[0]
-        chart_data[f"借 {r} 次"] = [
+        s = summary[summary["層次"] == LAYER_NAMES[r]].iloc[0]
+        chart_data[LAYER_NAMES[r]] = [
             s["總部位"] * y - s["總借款"] * lombard_rate for y in yields
         ]
 
@@ -874,6 +914,7 @@ else:
             fx_discount=fx_discount, utilization=utilization,
             lombard_rate=lombard_rate, blended_yield=blended_yield,
             credit_rate=credit_rate, draw_ratio=draw_ratio,
+            last_draw_ratio=last_draw_ratio, extra_pledge=extra_pledge,
             notice_line=notice_line, call_line=call_line,
             fund_decline=fund_decline, stress_rate=stress_rate,
             fx_shock=fx_shock, fx_pair=fx_pair, fx_base=fx_base,
