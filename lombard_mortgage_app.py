@@ -500,7 +500,9 @@ with col_y1:
 with col_y2:
     yield_fund = st.number_input("基金配息 (%)", 0.0, 20.0, 8.0, 0.1) / 100
 
-st.sidebar.subheader("3️⃣ 質借條件")
+st.sidebar.subheader("3️⃣ 銀行給的條件")
+st.sidebar.caption("這一組決定**額度多大**，也決定**追繳線在哪**")
+
 lombard_rate = st.sidebar.slider("Lombard 利率 (%)", 0.5, 10.0, 2.65, 0.05) / 100
 
 col_l1, col_l2 = st.sidebar.columns(2)
@@ -512,30 +514,22 @@ st.sidebar.caption("⚠️ 基金的實際成數常低於債券，建議先與�
 
 fx_discount = st.sidebar.slider("錯幣折扣 (%)", 50, 100, 90, 5) / 100
 utilization = st.sidebar.slider(
-    "額度動用比例 (%)〔銀行〕", 50, 100, 90, 5,
-    help="銀行額度公式裡的折算係數。調低會同時縮小額度與追繳門檻 → 使用率反而上升",
+    "額度動用比例 (%)", 50, 100, 90, 5,
+    help="銀行額度公式裡的折算係數，和 LTV、錯幣折扣乘在一起算出額度",
 ) / 100
 
+st.sidebar.subheader("4️⃣ 你要借多少")
+st.sidebar.caption("這一組只決定**實際借多少**，追繳線不動")
+
 draw_ratio = st.sidebar.slider(
-    "每層實際動用 (%)〔自己決定〕", 0, 100, 100, 5,
-    help="最後一層以外，每層實際借出可動用額度的幾成。調低 → 使用率下降",
+    "每層實際動用 (%)", 0, 100, 100, 5,
+    help="最後一層以外，每層實際借出可動用額度的幾成",
 ) / 100
 
 last_draw_ratio = st.sidebar.slider(
-    "最後一層動用 (%)〔自己決定〕", 0, 100, 100, 5,
+    "最後一層動用 (%)", 0, 100, 100, 5,
     help="只作用在每一列的最後一層。設 0% ＝ 只設質、不動用額度",
 ) / 100
-
-with st.sidebar.expander("❓ 三個「動用」差在哪"):
-    st.markdown("""
-| 參數 | 誰決定 | 影響 | 調低的效果 |
-|---|---|---|---|
-| **額度動用比例** | 銀行 | 額度公式的分母，追繳線跟著移動 | 使用率**上升** ⚠️ |
-| **每層實際動用** | 你 | 只影響借多少，追繳線不動 | 使用率**下降** ✅ |
-| **最後一層動用** | 你 | 同上，但只作用在最後一層 | 使用率**下降** ✅ |
-
-銀行把成數調低是**收緊**，不是給你緩衝；自己少借才是緩衝。
-""")
 
 st.sidebar.markdown("**要試算到第幾層**")
 LAYER_DEFAULTS = {1: True, 2: True, 3: True, 4: False, 5: False, 6: False}
@@ -552,11 +546,11 @@ extra_pledge = st.sidebar.number_input(
     help="客戶名下其他已持有、額外設質進擔保池的債券。只增加擔保品，不增加借款與配息",
 )
 
-st.sidebar.subheader("4️⃣ 追繳門檻")
+st.sidebar.subheader("5️⃣ 追繳門檻")
 notice_line = st.sidebar.slider("通知線：使用率 (%)", 70, 100, 95, 1) / 100
 call_line = st.sidebar.slider("追繳線：使用率 (%)", 80, 120, 100, 1) / 100
 
-st.sidebar.subheader("5️⃣ 風險假設")
+st.sidebar.subheader("6️⃣ 風險假設")
 fx_pair = st.sidebar.text_input("幣別對", value="USD/TWD")
 
 col_fx1, col_fx2 = st.sidebar.columns(2)
@@ -592,7 +586,13 @@ stress_rate = st.sidebar.slider("壓力測試：Lombard 升至 (%)", 1.0, 12.0, 
 # 主畫面
 # ============================================================
 
-st.title("🏦 Lombard 槓桿試算")
+head_l, head_r = st.columns([5, 1])
+with head_l:
+    st.title("🏦 Lombard 槓桿試算")
+with head_r:
+    st.write("")
+    if st.button("🔄 重新計算", help="強制重新整理所有表格與圖表"):
+        st.rerun()
 
 credit_rate = credit_line_rate(w_bond, ltv_bond, w_fund, ltv_fund, fx_discount, utilization)
 blended_yield = w_bond * yield_bond + w_fund * yield_fund
@@ -607,6 +607,50 @@ c3.metric("通知／追繳線",
           help="使用率 = 借款 ÷（擔保品市值 × 可動用額度成數）")
 c4.metric("利差", f"{(blended_yield - lombard_rate) * 100:.2f}%",
           help="混合配息率 − Lombard 利率")
+
+weighted_ltv = w_bond * ltv_bond + w_fund * ltv_fund
+
+with st.expander("🧮 公式拆解：兩組參數分別站在哪裡", expanded=False):
+    st.markdown(f"""
+**第一步｜銀行給你多少額度**（側邊欄 3️⃣，這組同時決定追繳線）
+
+```
+可動用額度成數 = 加權LTV {weighted_ltv*100:.1f}% × 錯幣折扣 {fx_discount*100:.0f}% × 額度動用比例 {utilization*100:.0f}%
+               = {credit_rate*100:.2f}%
+
+可動用額度 = 擔保品市值 × {credit_rate*100:.2f}%
+```
+
+**第二步｜你實際借多少**（側邊欄 4️⃣，這組不影響追繳線）
+
+```
+每層借款 = 該層可動用額度 × 每層實際動用 {draw_ratio*100:.0f}%
+         （最後一層改用 {last_draw_ratio*100:.0f}%）
+```
+
+**第三步｜使用率**
+
+```
+使用率 = 借款金額 ÷ 可動用額度   → 達 {notice_line*100:.0f}% 通知，達 {call_line*100:.0f}% 補繳
+```
+
+---
+
+**為什麼不能合併成一個滑桿**
+
+「額度動用比例」在**分母**裡，「每層實際動用」在**分子**裡。調低分母 → 使用率上升；調低分子 → 使用率下降。
+同樣從 90% 調到 80%，方向完全相反：
+
+| 調哪一個 | 借款 | 可動用額度 | 使用率 |
+|---|---|---|---|
+| 都不調（基準） | 976.6 | 1,200.8 | 81.3% |
+| 額度動用比例 ↓ | 831.6 | 989.1 | **84.1%** ↑ 更危險 |
+| 每層實際動用 ↓ | 722.2 | 1,046.2 | **69.0%** ↓ 更安全 |
+
+*（以第二層、本金 1,000 萬為例）*
+
+白話：**銀行把成數調低是在收傘，不是給你緩衝；自己少借才是緩衝。**
+""")
 
 st.caption(
     "**使用率 ＝ 借款金額 ÷（擔保品市值 × LTV × 錯幣折扣 × 額度動用比例）**　"
@@ -716,7 +760,8 @@ show_df(pos_df)
 
 with st.expander("📋 查看逐輪明細"):
     pick = st.radio("選擇層次", layers_list, index=min(2, len(layers_list) - 1),
-                    horizontal=True, format_func=lambda x: LAYER_NAMES[x])
+                    horizontal=True, format_func=lambda x: LAYER_NAMES[x],
+                    key=f"detail_{'-'.join(map(str, layers_list))}")
     d = detail_store[pick].copy()
     d["買入金額"] = d["買入金額"].map(fmt)
     d["質押借出"] = d["質押借出"].map(fmt)
@@ -883,6 +928,7 @@ sens_rounds = st.multiselect(
     "選擇要比較的層次", layers_list,
     default=[x for x in (1, 2) if x in layers_list],
     format_func=lambda x: LAYER_NAMES[x],
+    key=f"sens_{'-'.join(map(str, layers_list))}",
 )
 
 if sens_rounds:
@@ -913,6 +959,16 @@ st.divider()
 
 st.subheader("⑤ 輸出 PDF 摘要")
 
+# 參數指紋：任何一項變動，已產生的 PDF 就視為過期
+param_sig = (
+    capital_source, principal, mortgage_amount, mortgage_rate,
+    w_bond, yield_bond, yield_fund, ltv_bond, ltv_fund,
+    fx_discount, utilization, draw_ratio, last_draw_ratio,
+    lombard_rate, notice_line, call_line, extra_pledge,
+    fx_pair, fx_base, fx_now, fx_step, fund_decline, stress_rate,
+    tuple(layers_list),
+)
+
 font_paths = find_cjk_font()
 
 if font_paths is None:
@@ -942,9 +998,13 @@ else:
         )
         try:
             st.session_state["pdf_bytes"] = build_pdf(params, summary, terms, font_paths)
+            st.session_state["pdf_sig"] = param_sig
             st.success("PDF 已產生，可按下方按鈕下載。")
         except Exception as e:  # noqa: BLE001
             st.error(f"PDF 產生失敗：{e}")
+
+    if st.session_state.get("pdf_bytes") and st.session_state.get("pdf_sig") != param_sig:
+        st.warning("⚠️ 參數已變更，下方 PDF 仍是舊版。請重新按「產生 PDF 摘要報告」。")
 
     if st.session_state.get("pdf_bytes"):
         st.download_button(
