@@ -97,16 +97,28 @@ def value_drop_to(total_borrow, collateral, rate, threshold, fx_shock=0.0):
     return 1 - base / (1 - fx_shock)
 
 
-def mortgage_annual_payment(principal, annual_rate, years):
-    """房貸本息均攤——年繳金額（含本金攤還＋利息）"""
+def mortgage_annual_payment(principal, annual_rate, years, mode="本息均攤"):
+    """
+    房貸年繳金額
+      本息均攤：每期固定金額，含本金攤還＋利息，到期本金還清
+      只還息  ：每期只繳利息，本金到期一次清償
+    """
     if principal <= 0:
         return 0.0
+    if mode == "只還息":
+        return principal * annual_rate
     if annual_rate <= 0:
         return principal / years
     i = annual_rate / 12
     n = years * 12
     monthly = principal * i / (1 - (1 + i) ** (-n))
     return monthly * 12
+
+
+def mortgage_total_paid(principal, annual_rate, years, mode="本息均攤"):
+    """整個貸款期間總共要付出的金額（只還息者含到期還本）"""
+    annual = mortgage_annual_payment(principal, annual_rate, years, mode)
+    return annual * years + (principal if mode == "只還息" else 0.0)
 
 
 def survival_years(bond_position, fund_position, total_borrow, rate, threshold,
@@ -315,6 +327,7 @@ def build_pdf(params, summary, terms, font_paths):
     if has_mortgage:
         param_rows.append(["房貸金額", f"{p['mortgage_amount']:,} 萬",
                            "房貸利率", f"{p['mortgage_rate']*100:.2f}%"])
+        param_rows.append(["房貸還款方式", p["repay_mode"], "", ""])
     table(["項目", "數值", "項目", "數值"], param_rows, [45, 45, 45, 45],
           align=["L", "R", "L", "R"])
 
@@ -337,9 +350,9 @@ def build_pdf(params, summary, terms, font_paths):
 
     if has_mortgage:
         note("　｜　".join(
-            f"{t} 年期房貸年繳 {fmt(mortgage_annual_payment(p['mortgage_amount'], p['mortgage_rate'], t))} 萬"
+            f"{t} 年期房貸年繳 {fmt(mortgage_annual_payment(p['mortgage_amount'], p['mortgage_rate'], t, p['repay_mode']))} 萬"
             f"（含本金攤還＋利息）" if t == terms[0] else
-            f"{t} 年期房貸年繳 {fmt(mortgage_annual_payment(p['mortgage_amount'], p['mortgage_rate'], t))} 萬"
+            f"{t} 年期房貸年繳 {fmt(mortgage_annual_payment(p['mortgage_amount'], p['mortgage_rate'], t, p['repay_mode']))} 萬"
             for t in terms
         ))
         pdf.ln(1)
@@ -380,7 +393,7 @@ def build_pdf(params, summary, terms, font_paths):
         for _, r in summary.iterrows():
             row = [r["層次"]]
             for t in terms:
-                pay = mortgage_annual_payment(p["mortgage_amount"], p["mortgage_rate"], t)
+                pay = mortgage_annual_payment(p["mortgage_amount"], p["mortgage_rate"], t, p["repay_mode"])
                 need = (pay + r["總借款"] * p["lombard_rate"]) / r["總部位"] if r["總部位"] else 0
                 row.append(f"{need*100:.2f}%")
             be_rows.append(row)
@@ -503,8 +516,13 @@ else:
 
 if mortgage_amount > 0:
     mortgage_rate = st.sidebar.slider("房貸利率 (%)", 0.5, 8.0, 2.65, 0.05) / 100
+    repay_mode = st.sidebar.radio(
+        "房貸還款方式", ["本息均攤", "只還息"], index=0, horizontal=True,
+        help="本息均攤＝每期含本金攤還，到期還清；只還息＝每期只繳息，本金到期一次清償",
+    )
 else:
     mortgage_rate = 0.0
+    repay_mode = "本息均攤"
 
 has_mortgage = mortgage_amount > 0
 own_funded = not is_mortgage_funded
@@ -732,6 +750,9 @@ st.divider()
 # ------------------------------------------------------------
 
 layers_list = [0] + [n for n in range(1, 7) if show_layer[n]]
+if not repledge:
+    # 買入的債券不設質 → 不會產生新額度 → 疊不出第二層
+    layers_list = [n for n in layers_list if n <= 1]
 
 terms = [20, 30]
 
@@ -792,7 +813,7 @@ for r in layers_list:
     }
 
     for t in terms:
-        pay = mortgage_annual_payment(mortgage_amount, mortgage_rate, t)
+        pay = mortgage_annual_payment(mortgage_amount, mortgage_rate, t, repay_mode)
         row[f"{t}年覆蓋率"] = net_cf / pay if pay else 0
         row[f"{t}年結餘"] = net_cf - pay
         row[f"{t}年壓力覆蓋率"] = net_cf_stress / pay if pay else 0
@@ -818,13 +839,20 @@ pos_df = pd.DataFrame({
     "槓桿倍數": summary["槓桿倍數"].map(lambda x: f"{x:.2f} 倍"),
 })
 show_df(pos_df)
-st.caption(
-    ("✅ **再設質模式**：每層買入的債券設質回擔保池，擔保品＝總持債部位，額度隨層數放大。"
-     if repledge else
-     "⬜ **不再設質模式**：買入的債券留在非質押帳戶，擔保品固定為原始層"
-     "（＋追加設質），各層只是在同一筆額度內分次動用。")
-    + "　「動用時可動用額度」＝該層動用當下、擔保品所能給的總額度。"
-)
+if repledge:
+    st.caption(
+        "✅ **再設質模式**：每層買入的債券設質回擔保池，擔保品＝總持債部位，額度隨層數放大。"
+        "　「動用時可動用額度」＝該層動用當下、擔保品所能給的總額度。"
+    )
+else:
+    st.info(
+        "⬜ **不再設質模式：只會有第一層。**　"
+        "買入的債券留在非質押帳戶，不進擔保池 → 擔保品固定在 "
+        f"**{principal:,} 萬**、額度固定在 **{fmt(principal * credit_rate)} 萬** → "
+        "沒有新額度可用，第二層以後借不出任何一塊錢。\n\n"
+        "**疊層的唯一動力就是把買到的債再設質回去。** "
+        "想試算兩層以上，請勾選側邊欄的「各層買入的債券再設質回擔保池」。"
+    )
 
 st.divider()
 
@@ -837,13 +865,20 @@ st.subheader("② 現金流與房貸覆蓋率" if has_mortgage else "② 現金�
 if has_mortgage:
     pay_cols = st.columns(len(terms))
     for idx, t in enumerate(terms):
-        pay = mortgage_annual_payment(mortgage_amount, mortgage_rate, t)
-        total_paid = pay * t
+        pay = mortgage_annual_payment(mortgage_amount, mortgage_rate, t, repay_mode)
+        total_paid = mortgage_total_paid(mortgage_amount, mortgage_rate, t, repay_mode)
+        label = f"{t} 年期房貸年繳" + ("（本金＋利息）" if repay_mode == "本息均攤" else "（僅利息）")
         pay_cols[idx].metric(
-            f"{t} 年期房貸年繳（本金＋利息）", f"{fmt(pay)} 萬",
-            f"月繳 {pay / 12 * 10000:,.0f} 元　總繳 {total_paid:,.0f} 萬"
+            label, f"{fmt(pay)} 萬",
+            f"月繳 {pay / 12 * 10000:,.0f} 元　總支出 {total_paid:,.0f} 萬"
             f"（利息 {total_paid - mortgage_amount:,.0f} 萬）",
             delta_color="off",
+        )
+    if repay_mode == "只還息":
+        st.warning(
+            f"⚠️ **只還息**：每年只繳利息 {fmt(mortgage_annual_payment(mortgage_amount, mortgage_rate, terms[0], repay_mode))} 萬，"
+            f"**本金 {mortgage_amount:,} 萬到期要一次清償**。下方覆蓋率只比對利息，"
+            "不代表本金有著落——到期時得靠賣債、再融資或其他資金來源。"
         )
 
 display = pd.DataFrame({
@@ -861,6 +896,7 @@ if has_mortgage:
         )
         display[f"{t}年扣房貸後結餘（萬）"] = summary[f"{t}年結餘"].map(lambda x: f"{x:+,.1f}")
 
+
 show_df(display)
 
 if has_mortgage:
@@ -875,7 +911,7 @@ if has_mortgage:
     for _, r in summary.iterrows():
         row = {"層次": r["層次"]}
         for t in terms:
-            pay = mortgage_annual_payment(mortgage_amount, mortgage_rate, t)
+            pay = mortgage_annual_payment(mortgage_amount, mortgage_rate, t, repay_mode)
             need = (pay + r["總借款"] * lombard_rate) / r["總部位"] if r["總部位"] else 0
             row[f"{t} 年期"] = f"{need * 100:.2f}%"
         be_rows.append(row)
@@ -1007,7 +1043,7 @@ if sens_rounds:
     chart_df = pd.DataFrame(chart_data, index=[f"{y*100:.0f}%" for y in yields])
     if has_mortgage:
         for t in terms:
-            chart_df[f"{t}年房貸年繳"] = mortgage_annual_payment(mortgage_amount, mortgage_rate, t)
+            chart_df[f"{t}年房貸年繳"] = mortgage_annual_payment(mortgage_amount, mortgage_rate, t, repay_mode)
 
     st.line_chart(chart_df, height=360)
     st.caption(
@@ -1025,7 +1061,7 @@ st.subheader("⑤ 輸出 PDF 摘要")
 
 # 參數指紋：任何一項變動，已產生的 PDF 就視為過期
 param_sig = (
-    capital_source, principal, mortgage_amount, mortgage_rate,
+    capital_source, principal, mortgage_amount, mortgage_rate, repay_mode,
     w_bond, yield_bond, yield_fund, ltv_bond, ltv_fund,
     fx_discount, repledge, tuple(sorted(draw_ratios.items())),
     lombard_rate, notice_line, call_line, extra_pledge,
@@ -1054,6 +1090,7 @@ else:
             fx_discount=fx_discount,
             lombard_rate=lombard_rate, blended_yield=blended_yield,
             credit_rate=credit_rate, draw_desc=draw_desc, repledge=repledge,
+            repay_mode=repay_mode,
             extra_pledge=extra_pledge,
             notice_line=notice_line, call_line=call_line,
             fund_decline=fund_decline, stress_rate=stress_rate,
