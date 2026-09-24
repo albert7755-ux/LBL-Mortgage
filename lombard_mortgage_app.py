@@ -34,33 +34,44 @@ def credit_line_rate(w_bond, ltv_bond, w_fund, ltv_fund, fx_discount):
     return weighted_ltv * fx_discount
 
 
-def build_ladder(principal, rate, draw_ratios, layers):
+def build_ladder(principal, rate, draw_ratios, layers, repledge=True):
     """
     層次化質借階梯
       原始層  = 自有本金買入的債券（設質，尚未借款）
-      第 N 層 = 用第 N-1 層新增的額度借出、買入並設質的債券
-    draw_ratios: {層次: 動用比例}，各層可不同
-    回傳 (明細DF, 總部位, 總借款, 動用時可動用額度)
+      第 N 層 = 動用額度借出、買入債券
+
+    repledge=True  各層買入的債券再設質回擔保池 → 擔保品變大，可以繼續疊層
+    repledge=False 買入的債券留在非質押帳戶 → 擔保品固定，只能在原始額度內分次動用
+
+    回傳 (逐層明細DF, 總部位, 總借款, 擔保品, 最後一次動用時的額度)
     """
-    rows = [{"層次": "原始投入", "動用時額度": principal * rate,
-             "買入金額": principal, "質押借出": 0.0}]
-    current = principal
-    total_position = principal
-    total_borrow = 0.0
-    limit_at_draw = principal * rate   # 最後一次動用時的可動用額度
+    rows = [{"層次": "原始層", "動用時額度": principal * rate,
+             "本層借款": 0.0, "本層買入": principal,
+             "累計借款": 0.0, "累計部位": principal, "擔保品": principal}]
+
+    collateral = principal      # 已設質的擔保品
+    position = principal        # 總持債（含未設質）
+    borrow = 0.0
+    current = principal         # 上一層新增的擔保品
+    limit_at_draw = principal * rate
 
     for i in range(1, layers + 1):
-        limit_at_draw = total_position * rate      # 動用前的擔保品所能給的額度
-        borrowed = current * rate * draw_ratios.get(i, 1.0)
-        rows.append({"層次": f"第 {i} 層", "動用時額度": limit_at_draw,
-                     "買入金額": borrowed, "質押借出": borrowed})
-        total_borrow += borrowed
-        total_position += borrowed
-        current = borrowed
+        limit_at_draw = collateral * rate
+        available = max(limit_at_draw - borrow, 0.0)
+        d = draw_ratios.get(i, 1.0)
+        borrowed = min(current * rate * d, available) if repledge else available * d
 
-    rows.append({"層次": "合計", "動用時額度": limit_at_draw,
-                 "買入金額": total_position, "質押借出": total_borrow})
-    return pd.DataFrame(rows), total_position, total_borrow, limit_at_draw
+        borrow += borrowed
+        position += borrowed
+        current = borrowed
+        if repledge:
+            collateral += borrowed
+
+        rows.append({"層次": LAYER_NAMES[i], "動用時額度": limit_at_draw,
+                     "本層借款": borrowed, "本層買入": borrowed,
+                     "累計借款": borrow, "累計部位": position, "擔保品": collateral})
+
+    return pd.DataFrame(rows), position, borrow, collateral, limit_at_draw
 
 
 LAYER_NAMES = {0: "原始層", 1: "第一層", 2: "第二層", 3: "第三層",
@@ -294,7 +305,8 @@ def build_pdf(params, summary, terms, font_paths):
         ["債券 LTV", f"{p['ltv_bond']*100:.0f}%", "基金 LTV", f"{p['ltv_fund']*100:.0f}%"],
         ["錯幣折扣", f"{p['fx_discount']*100:.0f}%", "可動用額度成數", f"{p['credit_rate']*100:.2f}%"],
         ["Lombard 利率", f"{p['lombard_rate']*100:.2f}%", "混合配息率", f"{p['blended_yield']*100:.2f}%"],
-        ["各層動用比例", p["draw_desc"], "", ""],
+        ["各層動用比例", p["draw_desc"],
+         "買入債券再設質", "是" if p["repledge"] else "否"],
         ["追加設質", f"{p['extra_pledge']:,} 萬",
          "", ""],
         ["通知線（維持率）", f"{p['notice_line']*100:.0f}%",
@@ -311,12 +323,16 @@ def build_pdf(params, summary, terms, font_paths):
     # ---------- 部位結構 ----------
     section("二、部位結構")
     pos_rows = [
-        [r["層次"], fmt(r["總部位"]), fmt(r["總借款"]),
-         fmt(r["擔保品"]), f"{r['槓桿倍數']:.2f} 倍"]
+        [r["層次"], fmt(r["動用時額度"]), fmt(r["本層借款"]), fmt(r["總借款"]),
+         fmt(r["擔保品"]), fmt(r["總部位"]), f"{r['槓桿倍數']:.2f} 倍"]
         for _, r in summary.iterrows()
     ]
-    table(["層次", "總部位（萬）", "總借款（萬）", "擔保品（萬）", "槓桿倍數"], pos_rows,
-          [30, 40, 40, 40, 30], align=["C", "R", "R", "R", "C"])
+    table(["層次", "動用時額度", "本層借款", "累計借款", "已設質擔保品", "總持債部位", "槓桿"],
+          pos_rows, [20, 28, 26, 28, 30, 30, 20],
+          align=["C", "R", "R", "R", "R", "R", "C"])
+    note("再設質模式：買入債券設質回擔保池，擔保品＝總持債部位。"
+         if p["repledge"] else
+         "不再設質模式：買入債券留在非質押帳戶，擔保品固定為原始層（＋追加設質）。")
 
     # ---------- 現金流 ----------
     section("三、現金流與房貸覆蓋率" if has_mortgage else "三、現金流與自有資金報酬率")
@@ -539,6 +555,16 @@ max_layer = max([n for n in range(1, 7) if show_layer[n]], default=0)
 st.sidebar.subheader("5️⃣ 各層動用比例")
 st.sidebar.caption("這一組只決定**實際借多少**，追繳線不動")
 
+repledge = st.sidebar.checkbox(
+    "各層買入的債券再設質回擔保池", value=True,
+    help="勾選＝借出的錢買債後再設質，擔保品變大、可繼續疊層；"
+         "取消＝買入的債券留在非質押帳戶，擔保品固定為原始層，只能在原始額度內分次動用",
+)
+st.sidebar.caption(
+    "✅ 再設質：擔保品隨層數放大，維持率被稀釋　｜　"
+    "⬜ 不再設質：擔保品固定，維持率會快速逼近追繳線"
+)
+
 uniform_draw = st.sidebar.slider(
     "統一設定 (%)", 0, 100, 100, 5,
     help="一次把所有層設成同一個比例",
@@ -710,14 +736,13 @@ terms = [20, 30]
 fx_scenarios = [round(fx_base - i * fx_step, 4) for i in range(FX_SCENARIO_COUNT)]
 
 summary_rows = []
-detail_store = {}
 
 for r in layers_list:
-    ladder_df, total_position, total_borrow, limit_at_draw = build_ladder(
-        principal, credit_rate, draw_ratios, r)
-    detail_store[r] = ladder_df
-    collateral = total_position + extra_pledge
+    ladder_df, total_position, total_borrow, pledged, limit_at_draw = build_ladder(
+        principal, credit_rate, draw_ratios, r, repledge)
+    collateral = pledged + extra_pledge
     limit_at_draw += extra_pledge * credit_rate
+    layer_borrow = float(ladder_df["本層借款"].iloc[-1])
 
     annual_income = total_position * blended_yield
     annual_interest = total_borrow * lombard_rate
@@ -745,6 +770,7 @@ for r in layers_list:
         "層次": LAYER_NAMES[r],
         "總部位": total_position,
         "總借款": total_borrow,
+        "本層借款": layer_borrow,
         "擔保品": collateral,
         "可動用額度": collateral * (1 - fx_shock) * credit_rate,
         "槓桿倍數": total_position / principal if principal else 0,
@@ -778,22 +804,23 @@ summary = pd.DataFrame(summary_rows)
 
 st.subheader("① 部位結構")
 
-pos_df = summary[["層次", "總部位", "總借款", "槓桿倍數"]].copy()
-pos_df["總部位"] = pos_df["總部位"].map(fmt)
-pos_df["總借款"] = pos_df["總借款"].map(fmt)
-pos_df["槓桿倍數"] = pos_df["槓桿倍數"].map(lambda x: f"{x:.2f} 倍")
-pos_df.columns = ["層次", "總部位（萬）", "總借款（萬）", "槓桿倍數"]
+pos_df = pd.DataFrame({
+    "層次": summary["層次"],
+    "動用時可動用額度（萬）": summary["動用時額度"].map(fmt),
+    "本層借款（萬）": summary["本層借款"].map(fmt),
+    "累計總借款（萬）": summary["總借款"].map(fmt),
+    "已設質擔保品（萬）": summary["擔保品"].map(fmt),
+    "總持債部位（萬）": summary["總部位"].map(fmt),
+    "槓桿倍數": summary["槓桿倍數"].map(lambda x: f"{x:.2f} 倍"),
+})
 show_df(pos_df)
-
-with st.expander("📋 查看逐輪明細"):
-    pick = st.radio("選擇層次", layers_list, index=min(2, len(layers_list) - 1),
-                    horizontal=True, format_func=lambda x: LAYER_NAMES[x],
-                    key=f"detail_{'-'.join(map(str, layers_list))}")
-    d = detail_store[pick].copy()
-    for c in ("動用時額度", "買入金額", "質押借出"):
-        d[c] = d[c].map(fmt)
-    d.columns = ["層次", "動用時可動用額度（萬）", "買入金額（萬）", "質押借出（萬）"]
-    show_df(d)
+st.caption(
+    ("✅ **再設質模式**：每層買入的債券設質回擔保池，擔保品＝總持債部位，額度隨層數放大。"
+     if repledge else
+     "⬜ **不再設質模式**：買入的債券留在非質押帳戶，擔保品固定為原始層"
+     "（＋追加設質），各層只是在同一筆額度內分次動用。")
+    + "　「動用時可動用額度」＝該層動用當下、擔保品所能給的總額度。"
+)
 
 st.divider()
 
@@ -996,7 +1023,7 @@ st.subheader("⑤ 輸出 PDF 摘要")
 param_sig = (
     capital_source, principal, mortgage_amount, mortgage_rate,
     w_bond, yield_bond, yield_fund, ltv_bond, ltv_fund,
-    fx_discount, tuple(sorted(draw_ratios.items())),
+    fx_discount, repledge, tuple(sorted(draw_ratios.items())),
     lombard_rate, notice_line, call_line, extra_pledge,
     fx_pair, fx_base, fx_now, fx_step, fund_decline, stress_rate,
     tuple(layers_list),
@@ -1022,7 +1049,7 @@ else:
             ltv_bond=ltv_bond, ltv_fund=ltv_fund,
             fx_discount=fx_discount,
             lombard_rate=lombard_rate, blended_yield=blended_yield,
-            credit_rate=credit_rate, draw_desc=draw_desc,
+            credit_rate=credit_rate, draw_desc=draw_desc, repledge=repledge,
             extra_pledge=extra_pledge,
             notice_line=notice_line, call_line=call_line,
             fund_decline=fund_decline, stress_rate=stress_rate,
