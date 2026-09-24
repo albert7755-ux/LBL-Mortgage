@@ -34,28 +34,33 @@ def credit_line_rate(w_bond, ltv_bond, w_fund, ltv_fund, fx_discount):
     return weighted_ltv * fx_discount
 
 
-def build_ladder(principal, rate, draw_ratio, last_draw_ratio, layers):
+def build_ladder(principal, rate, draw_ratios, layers):
     """
     層次化質借階梯
       原始層  = 自有本金買入的債券（設質，尚未借款）
-      第 N 層 = 用第 N-1 層的額度借出、買入並設質的債券
-    最後一層可單獨設定動用比例；設 0% 即「只設質、不動用額度」
+      第 N 層 = 用第 N-1 層新增的額度借出、買入並設質的債券
+    draw_ratios: {層次: 動用比例}，各層可不同
+    回傳 (明細DF, 總部位, 總借款, 動用時可動用額度)
     """
-    rows = [{"層次": "原始投入", "買入金額": principal, "質押借出": 0.0}]
+    rows = [{"層次": "原始投入", "動用時額度": principal * rate,
+             "買入金額": principal, "質押借出": 0.0}]
     current = principal
     total_position = principal
     total_borrow = 0.0
+    limit_at_draw = principal * rate   # 最後一次動用時的可動用額度
 
     for i in range(1, layers + 1):
-        dr = last_draw_ratio if i == layers else draw_ratio
-        borrowed = current * rate * dr
-        rows.append({"層次": f"第 {i} 層", "買入金額": borrowed, "質押借出": borrowed})
+        limit_at_draw = total_position * rate      # 動用前的擔保品所能給的額度
+        borrowed = current * rate * draw_ratios.get(i, 1.0)
+        rows.append({"層次": f"第 {i} 層", "動用時額度": limit_at_draw,
+                     "買入金額": borrowed, "質押借出": borrowed})
         total_borrow += borrowed
         total_position += borrowed
         current = borrowed
 
-    rows.append({"層次": "合計", "買入金額": total_position, "質押借出": total_borrow})
-    return pd.DataFrame(rows), total_position, total_borrow
+    rows.append({"層次": "合計", "動用時額度": limit_at_draw,
+                 "買入金額": total_position, "質押借出": total_borrow})
+    return pd.DataFrame(rows), total_position, total_borrow, limit_at_draw
 
 
 LAYER_NAMES = {0: "原始層", 1: "第一層", 2: "第二層", 3: "第三層",
@@ -289,12 +294,11 @@ def build_pdf(params, summary, terms, font_paths):
         ["債券 LTV", f"{p['ltv_bond']*100:.0f}%", "基金 LTV", f"{p['ltv_fund']*100:.0f}%"],
         ["錯幣折扣", f"{p['fx_discount']*100:.0f}%", "可動用額度成數", f"{p['credit_rate']*100:.2f}%"],
         ["Lombard 利率", f"{p['lombard_rate']*100:.2f}%", "混合配息率", f"{p['blended_yield']*100:.2f}%"],
-        ["每層實際動用", f"{p['draw_ratio']*100:.0f}%",
-         "最後一層動用", f"{p['last_draw_ratio']*100:.0f}%"],
+        ["各層動用比例", p["draw_desc"], "", ""],
         ["追加設質", f"{p['extra_pledge']:,} 萬",
          "", ""],
-        ["通知線（使用率）", f"{p['notice_line']*100:.0f}%",
-         "追繳線（使用率）", f"{p['call_line']*100:.0f}%"],
+        ["通知線（維持率）", f"{p['notice_line']*100:.0f}%",
+         "追繳線（維持率）", f"{p['call_line']*100:.0f}%"],
         [f"建倉匯率（{p['fx_pair']}）", f"{p['fx_base']:.2f}",
          "評估匯率", f"{p['fx_now']:.2f}"],
     ]
@@ -380,16 +384,19 @@ def build_pdf(params, summary, terms, font_paths):
         risk_rows.append([
             r["層次"],
             fmt(r["可動用額度"]),
-            f"{r['目前使用率']*100:.1f}%",
+            f"{r['使用率（動用時）']*100:.1f}%" if r["總借款"] > 0 else "—",
+            f"{r['維持率']*100:.1f}%",
             drop_cell(r["距通知線"], with_icon=False, borrow=r["總借款"]),
             drop_cell(r["距追繳線"], with_icon=False, borrow=r["總借款"]),
             surv_text,
         ])
-    table(["層次", "可動用額度（萬）", "目前使用率",
+    table(["層次", "可動用額度（萬）", "使用率（動用時）", "維持率",
            f"距通知線{p['notice_line']*100:.0f}%", f"距追繳線{p['call_line']*100:.0f}%",
-           "淨值侵蝕存活年數"],
-          risk_rows, [24, 34, 26, 28, 36, 38], align=["C", "R", "R", "R", "C", "C"])
-    note("使用率 ＝ 借款 ÷（擔保品市值 × LTV × 錯幣折扣）。"
+           "存活年數"],
+          risk_rows, [22, 30, 26, 24, 26, 30, 26],
+          align=["C", "R", "R", "R", "R", "C", "C"])
+    note("使用率（動用時）＝ 總借款 ÷ 該層動用當下的可動用額度；"
+         "維持率 ＝ 總借款 ÷ 目前擔保品的可動用額度（追繳判斷基準）。"
          + (f"　已套用 {p['fx_pair']} {p['fx_base']:.2f} → {p['fx_now']:.2f}。"
             if abs(p["fx_shock"]) > 1e-9 else "")
          + f"　淨值侵蝕假設：基金淨值年跌 {p['fund_decline']*100:.1f}%，債券持有到期不計價格變動。")
@@ -517,20 +524,7 @@ fx_discount = st.sidebar.slider(
     help="錯幣時銀行對擔保品價值的折扣；本幣擔保請設 100%",
 ) / 100
 
-st.sidebar.subheader("4️⃣ 你要借多少")
-st.sidebar.caption("這一組只決定**實際借多少**，追繳線不動")
-
-draw_ratio = st.sidebar.slider(
-    "每層實際動用 (%)", 0, 100, 100, 5,
-    help="最後一層以外，每層實際借出可動用額度的幾成",
-) / 100
-
-last_draw_ratio = st.sidebar.slider(
-    "最後一層動用 (%)", 0, 100, 100, 5,
-    help="只作用在每一列的最後一層。設 0% ＝ 只設質、不動用額度",
-) / 100
-
-st.sidebar.markdown("**要試算到第幾層**")
+st.sidebar.subheader("4️⃣ 要試算到第幾層")
 LAYER_DEFAULTS = {1: True, 2: True, 3: True, 4: False, 5: False, 6: False}
 show_layer = {}
 ly_cols = st.sidebar.columns(3)
@@ -540,16 +534,44 @@ for n in range(1, 7):
                                     key=f"layer_{n}")
 st.sidebar.caption("原始層（不借款）一律顯示，作為對照基準")
 
+max_layer = max([n for n in range(1, 7) if show_layer[n]], default=0)
+
+st.sidebar.subheader("5️⃣ 各層動用比例")
+st.sidebar.caption("這一組只決定**實際借多少**，追繳線不動")
+
+uniform_draw = st.sidebar.slider(
+    "統一設定 (%)", 0, 100, 100, 5,
+    help="一次把所有層設成同一個比例",
+)
+per_layer_draw = st.sidebar.checkbox("各層分別設定", value=False)
+
+draw_ratios = {}
+if per_layer_draw and max_layer > 0:
+    for n in range(1, max_layer + 1):
+        draw_ratios[n] = st.sidebar.slider(
+            f"{LAYER_NAMES[n]}動用 (%)", 0, 100, uniform_draw, 5,
+            key=f"draw_{n}",
+        ) / 100
+else:
+    draw_ratios = {n: uniform_draw / 100 for n in range(1, 7)}
+
+_used = [n for n in range(1, 7) if show_layer[n]]
+if not _used or len(set(draw_ratios[n] for n in _used)) == 1:
+    draw_desc = f"全部 {uniform_draw:.0f}%" if not _used else \
+        f"全部 {draw_ratios[_used[0]]*100:.0f}%"
+else:
+    draw_desc = "／".join(f"{LAYER_NAMES[n]} {draw_ratios[n]*100:.0f}%" for n in _used)
+
 extra_pledge = st.sidebar.number_input(
     "追加設質（萬元）", min_value=0, max_value=100000, value=0, step=100,
     help="客戶名下其他已持有、額外設質進擔保池的債券。只增加擔保品，不增加借款與配息",
 )
 
-st.sidebar.subheader("5️⃣ 追繳門檻")
-notice_line = st.sidebar.slider("通知線：使用率 (%)", 70, 100, 95, 1) / 100
-call_line = st.sidebar.slider("追繳線：使用率 (%)", 80, 120, 100, 1) / 100
+st.sidebar.subheader("6️⃣ 追繳門檻")
+notice_line = st.sidebar.slider("通知線：維持率 (%)", 70, 100, 95, 1) / 100
+call_line = st.sidebar.slider("追繳線：維持率 (%)", 80, 120, 100, 1) / 100
 
-st.sidebar.subheader("6️⃣ 風險假設")
+st.sidebar.subheader("7️⃣ 風險假設")
 fx_pair = st.sidebar.text_input("幣別對", value="USD/TWD")
 
 col_fx1, col_fx2 = st.sidebar.columns(2)
@@ -601,9 +623,9 @@ c1.metric("可動用額度成數", f"{credit_rate * 100:.2f}%",
           help=f"加權LTV {(w_bond*ltv_bond + w_fund*ltv_fund)*100:.1f}% × "
                f"錯幣折扣 {fx_discount*100:.0f}%")
 c2.metric("混合配息率", f"{blended_yield * 100:.2f}%")
-c3.metric("通知／追繳線",
+c3.metric("通知／追繳線（維持率）",
           f"{notice_line*100:.0f}% / {call_line*100:.0f}%",
-          help="使用率 = 借款 ÷（擔保品市值 × 可動用額度成數）")
+          help="維持率 = 借款 ÷（擔保品市值 × 可動用額度成數）")
 c4.metric("利差", f"{(blended_yield - lombard_rate) * 100:.2f}%",
           help="混合配息率 − Lombard 利率")
 
@@ -618,19 +640,19 @@ with st.expander("🧮 公式拆解：算式怎麼跑的", expanded=False):
 可動用額度     = 擔保品市值 × {credit_rate*100:.2f}%
 ```
 
-這個成數同時就是**追繳線**——借款一旦等於可動用額度，使用率就是 100%。
+這個成數同時就是**追繳線**——借款一旦等於可動用額度，維持率就是 100%。
 
 **第二步｜你實際借多少**（側邊欄 4️⃣）
 
 ```
-每層借款 = 該層可動用額度 × 每層實際動用 {draw_ratio*100:.0f}%
-         （最後一層改用 {last_draw_ratio*100:.0f}%）
+每層借款 = 該層新增的可動用額度 × 該層動用比例
+各層設定：{draw_desc}
 ```
 
-**第三步｜使用率**
+**第三步｜維持率（追繳判斷）**
 
 ```
-使用率 = 借款金額 ÷ 可動用額度   → 達 {notice_line*100:.0f}% 通知，達 {call_line*100:.0f}% 補繳
+維持率 = 借款金額 ÷ 可動用額度   → 達 {notice_line*100:.0f}% 通知，達 {call_line*100:.0f}% 補繳
 ```
 
 ---
@@ -640,21 +662,21 @@ with st.expander("🧮 公式拆解：算式怎麼跑的", expanded=False):
 - **3️⃣ 的參數（LTV、錯幣折扣）是銀行給的**，決定額度大小，追繳線也跟著跑
 - **4️⃣ 的參數（動用比例）是你決定的**，只影響借多少，追繳線站在原地
 
-所以想降低使用率，能動的只有 4️⃣ 那一組，以及「追加設質」。
+所以想降低維持率，能動的只有 5️⃣ 那一組，以及「追加設質」。
 
 ---
 
 **本金是自有資金還是房貸借來的，完全不影響這裡**
 
 Lombard 額度只看「設質進去的擔保品」，不問這筆錢從哪來。
-同樣的部位，額度、使用率、追繳線三者都一模一樣。
+同樣的部位，額度、維持率、追繳線三者都一模一樣。
 
 差別只在**被追繳時的後果**：自有資金的損失上限是投入的本金；
 房貸借來的，斷頭後房貸債務還在，缺口要由房子的淨值吸收。
 """)
 
 st.caption(
-    "**使用率 ＝ 借款金額 ÷（擔保品市值 × LTV × 錯幣折扣）**　"
+    "**維持率 ＝ 借款金額 ÷（擔保品市值 × LTV × 錯幣折扣）**　"
     f"→ 達 {notice_line*100:.0f}% 啟動通知，達 {call_line*100:.0f}% 須補繳"
 )
 
@@ -681,6 +703,7 @@ st.divider()
 # ------------------------------------------------------------
 
 layers_list = [0] + [n for n in range(1, 7) if show_layer[n]]
+
 terms = [20, 30]
 
 # 雙因子矩陣的情境匯率：自建倉匯率往下每檔遞減 fx_step
@@ -690,10 +713,11 @@ summary_rows = []
 detail_store = {}
 
 for r in layers_list:
-    ladder_df, total_position, total_borrow = build_ladder(
-        principal, credit_rate, draw_ratio, last_draw_ratio, r)
+    ladder_df, total_position, total_borrow, limit_at_draw = build_ladder(
+        principal, credit_rate, draw_ratios, r)
     detail_store[r] = ladder_df
     collateral = total_position + extra_pledge
+    limit_at_draw += extra_pledge * credit_rate
 
     annual_income = total_position * blended_yield
     annual_interest = total_borrow * lombard_rate
@@ -728,7 +752,9 @@ for r in layers_list:
         "年利息": annual_interest,
         "年淨現金流": net_cf,
         "自有資金報酬率": net_cf / principal if principal else 0,
-        "目前使用率": util_now,
+        "動用時額度": limit_at_draw,
+        "使用率（動用時）": total_borrow / limit_at_draw if limit_at_draw > 0 else 0.0,
+        "維持率": util_now,
         "距通知線": drop_notice,
         "距追繳線": drop_call,
         "匯率情境": fx_grid,
@@ -764,9 +790,9 @@ with st.expander("📋 查看逐輪明細"):
                     horizontal=True, format_func=lambda x: LAYER_NAMES[x],
                     key=f"detail_{'-'.join(map(str, layers_list))}")
     d = detail_store[pick].copy()
-    d["買入金額"] = d["買入金額"].map(fmt)
-    d["質押借出"] = d["質押借出"].map(fmt)
-    d.columns = ["層次", "買入金額（萬）", "質押借出（萬）"]
+    for c in ("動用時額度", "買入金額", "質押借出"):
+        d[c] = d[c].map(fmt)
+    d.columns = ["層次", "動用時可動用額度（萬）", "買入金額（萬）", "質押借出（萬）"]
     show_df(d)
 
 st.divider()
@@ -837,13 +863,17 @@ st.divider()
 
 st.subheader("③ 風險評估")
 
-st.markdown("**額度使用率與擔保品可跌幅度**")
+st.markdown("**維持率與擔保品可跌幅度**")
 mc = pd.DataFrame({
     "層次": summary["層次"],
     "借款（萬）": summary["總借款"].map(fmt),
     "擔保品（萬）": summary["擔保品"].map(fmt),
     "可動用額度（萬）": summary["可動用額度"].map(fmt),
-    "目前使用率": summary["目前使用率"].map(
+    "使用率（動用時）": [
+        "—" if b <= 0 else f"{x*100:.1f}%"
+        for x, b in zip(summary["使用率（動用時）"], summary["總借款"])
+    ],
+    "維持率（追繳判斷）": summary["維持率"].map(
         lambda x: (
             f"❌ {x*100:.1f}%（已達追繳）" if x >= call_line
             else f"⚠️ {x*100:.1f}%（已達通知）" if x >= notice_line
@@ -860,7 +890,9 @@ mc = pd.DataFrame({
 })
 show_df(mc)
 st.caption(
-    "使用率 ＝ 借款 ÷（擔保品市值 × LTV × 錯幣折扣）。"
+    "**使用率（動用時）** ＝ 總借款 ÷ 該層動用**當下**的可動用額度——你借了核給額度的幾成　｜　"
+    "**維持率** ＝ 總借款 ÷ **目前**擔保品的可動用額度"
+    "（借款 ÷ 擔保品市值 × LTV × 錯幣折扣），**這個才是追繳的判斷基準**。"
     "　✅ 可跌 ≥25%　⚠️ 18–25%　❌ <18%　｜　參考：2022 年長天期投等債最大回檔逾 20%"
     + (f"　**已套用 {fx_pair} {fx_base:.2f} → {fx_now:.2f}**" if abs(fx_shock) > 1e-9 else "")
 )
@@ -964,7 +996,7 @@ st.subheader("⑤ 輸出 PDF 摘要")
 param_sig = (
     capital_source, principal, mortgage_amount, mortgage_rate,
     w_bond, yield_bond, yield_fund, ltv_bond, ltv_fund,
-    fx_discount, draw_ratio, last_draw_ratio,
+    fx_discount, tuple(sorted(draw_ratios.items())),
     lombard_rate, notice_line, call_line, extra_pledge,
     fx_pair, fx_base, fx_now, fx_step, fund_decline, stress_rate,
     tuple(layers_list),
@@ -990,8 +1022,8 @@ else:
             ltv_bond=ltv_bond, ltv_fund=ltv_fund,
             fx_discount=fx_discount,
             lombard_rate=lombard_rate, blended_yield=blended_yield,
-            credit_rate=credit_rate, draw_ratio=draw_ratio,
-            last_draw_ratio=last_draw_ratio, extra_pledge=extra_pledge,
+            credit_rate=credit_rate, draw_desc=draw_desc,
+            extra_pledge=extra_pledge,
             notice_line=notice_line, call_line=call_line,
             fund_decline=fund_decline, stress_rate=stress_rate,
             fx_shock=fx_shock, fx_pair=fx_pair, fx_base=fx_base,
