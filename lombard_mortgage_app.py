@@ -25,13 +25,13 @@ st.set_page_config(
 # 核心計算函式
 # ============================================================
 
-def credit_line_rate(w_bond, ltv_bond, w_fund, ltv_fund, fx_discount, utilization):
+def credit_line_rate(w_bond, ltv_bond, w_fund, ltv_fund, fx_discount):
     """
-    可動用額度成數 = 加權LTV × 錯幣折扣 × 額度動用比例
+    可動用額度成數 = 加權LTV × 錯幣折扣
     這同時是「額度的分母基準」與「使用率 100%（追繳）」的臨界成數
     """
     weighted_ltv = w_bond * ltv_bond + w_fund * ltv_fund
-    return weighted_ltv * fx_discount * utilization
+    return weighted_ltv * fx_discount
 
 
 def build_ladder(principal, rate, draw_ratio, last_draw_ratio, layers):
@@ -287,12 +287,12 @@ def build_pdf(params, summary, terms, font_paths):
         ["債券比重", f"{p['w_bond']*100:.0f}%", "債券配息率", f"{p['yield_bond']*100:.2f}%"],
         ["基金比重", f"{p['w_fund']*100:.0f}%", "基金配息率", f"{p['yield_fund']*100:.2f}%"],
         ["債券 LTV", f"{p['ltv_bond']*100:.0f}%", "基金 LTV", f"{p['ltv_fund']*100:.0f}%"],
-        ["錯幣折扣", f"{p['fx_discount']*100:.0f}%", "額度動用比例", f"{p['utilization']*100:.0f}%"],
+        ["錯幣折扣", f"{p['fx_discount']*100:.0f}%", "可動用額度成數", f"{p['credit_rate']*100:.2f}%"],
         ["Lombard 利率", f"{p['lombard_rate']*100:.2f}%", "混合配息率", f"{p['blended_yield']*100:.2f}%"],
-        ["可動用額度成數", f"{p['credit_rate']*100:.2f}%",
-         "每層實際動用", f"{p['draw_ratio']*100:.0f}%"],
-        ["最後一層動用", f"{p['last_draw_ratio']*100:.0f}%",
-         "追加設質", f"{p['extra_pledge']:,} 萬"],
+        ["每層實際動用", f"{p['draw_ratio']*100:.0f}%",
+         "最後一層動用", f"{p['last_draw_ratio']*100:.0f}%"],
+        ["追加設質", f"{p['extra_pledge']:,} 萬",
+         "", ""],
         ["通知線（使用率）", f"{p['notice_line']*100:.0f}%",
          "追繳線（使用率）", f"{p['call_line']*100:.0f}%"],
         [f"建倉匯率（{p['fx_pair']}）", f"{p['fx_base']:.2f}",
@@ -389,7 +389,7 @@ def build_pdf(params, summary, terms, font_paths):
            f"距通知線{p['notice_line']*100:.0f}%", f"距追繳線{p['call_line']*100:.0f}%",
            "淨值侵蝕存活年數"],
           risk_rows, [24, 34, 26, 28, 36, 38], align=["C", "R", "R", "R", "C", "C"])
-    note("使用率 ＝ 借款 ÷（擔保品市值 × LTV × 錯幣折扣 × 額度動用比例）。"
+    note("使用率 ＝ 借款 ÷（擔保品市值 × LTV × 錯幣折扣）。"
          + (f"　已套用 {p['fx_pair']} {p['fx_base']:.2f} → {p['fx_now']:.2f}。"
             if abs(p["fx_shock"]) > 1e-9 else "")
          + f"　淨值侵蝕假設：基金淨值年跌 {p['fund_decline']*100:.1f}%，債券持有到期不計價格變動。")
@@ -512,10 +512,9 @@ with col_l2:
     ltv_fund = st.number_input("基金 LTV (%)", 0, 100, 75, 5) / 100
 st.sidebar.caption("⚠️ 基金的實際成數常低於債券，建議先與授信確認")
 
-fx_discount = st.sidebar.slider("錯幣折扣 (%)", 50, 100, 90, 5) / 100
-utilization = st.sidebar.slider(
-    "額度動用比例 (%)", 50, 100, 90, 5,
-    help="銀行額度公式裡的折算係數，和 LTV、錯幣折扣乘在一起算出額度",
+fx_discount = st.sidebar.slider(
+    "錯幣折扣 (%)", 50, 100, 90, 5,
+    help="錯幣時銀行對擔保品價值的折扣；本幣擔保請設 100%",
 ) / 100
 
 st.sidebar.subheader("4️⃣ 你要借多少")
@@ -594,13 +593,13 @@ with head_r:
     if st.button("🔄 重新計算", help="強制重新整理所有表格與圖表"):
         st.rerun()
 
-credit_rate = credit_line_rate(w_bond, ltv_bond, w_fund, ltv_fund, fx_discount, utilization)
+credit_rate = credit_line_rate(w_bond, ltv_bond, w_fund, ltv_fund, fx_discount)
 blended_yield = w_bond * yield_bond + w_fund * yield_fund
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("可動用額度成數", f"{credit_rate * 100:.2f}%",
           help=f"加權LTV {(w_bond*ltv_bond + w_fund*ltv_fund)*100:.1f}% × "
-               f"錯幣 {fx_discount*100:.0f}% × 額度動用 {utilization*100:.0f}%")
+               f"錯幣折扣 {fx_discount*100:.0f}%")
 c2.metric("混合配息率", f"{blended_yield * 100:.2f}%")
 c3.metric("通知／追繳線",
           f"{notice_line*100:.0f}% / {call_line*100:.0f}%",
@@ -610,18 +609,18 @@ c4.metric("利差", f"{(blended_yield - lombard_rate) * 100:.2f}%",
 
 weighted_ltv = w_bond * ltv_bond + w_fund * ltv_fund
 
-with st.expander("🧮 公式拆解：兩組參數分別站在哪裡", expanded=False):
+with st.expander("🧮 公式拆解：算式怎麼跑的", expanded=False):
     st.markdown(f"""
-**第一步｜銀行給你多少額度**（側邊欄 3️⃣，這組同時決定追繳線）
+**第一步｜銀行給你多少額度**（側邊欄 3️⃣）
 
 ```
-可動用額度成數 = 加權LTV {weighted_ltv*100:.1f}% × 錯幣折扣 {fx_discount*100:.0f}% × 額度動用比例 {utilization*100:.0f}%
-               = {credit_rate*100:.2f}%
-
-可動用額度 = 擔保品市值 × {credit_rate*100:.2f}%
+可動用額度成數 = 加權LTV {weighted_ltv*100:.1f}% × 錯幣折扣 {fx_discount*100:.0f}% = {credit_rate*100:.2f}%
+可動用額度     = 擔保品市值 × {credit_rate*100:.2f}%
 ```
 
-**第二步｜你實際借多少**（側邊欄 4️⃣，這組不影響追繳線）
+這個成數同時就是**追繳線**——借款一旦等於可動用額度，使用率就是 100%。
+
+**第二步｜你實際借多少**（側邊欄 4️⃣）
 
 ```
 每層借款 = 該層可動用額度 × 每層實際動用 {draw_ratio*100:.0f}%
@@ -636,24 +635,26 @@ with st.expander("🧮 公式拆解：兩組參數分別站在哪裡", expanded=
 
 ---
 
-**為什麼不能合併成一個滑桿**
+**銀行條件 vs 你的決定**
 
-「額度動用比例」在**分母**裡，「每層實際動用」在**分子**裡。調低分母 → 使用率上升；調低分子 → 使用率下降。
-同樣從 90% 調到 80%，方向完全相反：
+- **3️⃣ 的參數（LTV、錯幣折扣）是銀行給的**，決定額度大小，追繳線也跟著跑
+- **4️⃣ 的參數（動用比例）是你決定的**，只影響借多少，追繳線站在原地
 
-| 調哪一個 | 借款 | 可動用額度 | 使用率 |
-|---|---|---|---|
-| 都不調（基準） | 976.6 | 1,200.8 | 81.3% |
-| 額度動用比例 ↓ | 831.6 | 989.1 | **84.1%** ↑ 更危險 |
-| 每層實際動用 ↓ | 722.2 | 1,046.2 | **69.0%** ↓ 更安全 |
+所以想降低使用率，能動的只有 4️⃣ 那一組，以及「追加設質」。
 
-*（以第二層、本金 1,000 萬為例）*
+---
 
-白話：**銀行把成數調低是在收傘，不是給你緩衝；自己少借才是緩衝。**
+**本金是自有資金還是房貸借來的，完全不影響這裡**
+
+Lombard 額度只看「設質進去的擔保品」，不問這筆錢從哪來。
+同樣的部位，額度、使用率、追繳線三者都一模一樣。
+
+差別只在**被追繳時的後果**：自有資金的損失上限是投入的本金；
+房貸借來的，斷頭後房貸債務還在，缺口要由房子的淨值吸收。
 """)
 
 st.caption(
-    "**使用率 ＝ 借款金額 ÷（擔保品市值 × LTV × 錯幣折扣 × 額度動用比例）**　"
+    "**使用率 ＝ 借款金額 ÷（擔保品市值 × LTV × 錯幣折扣）**　"
     f"→ 達 {notice_line*100:.0f}% 啟動通知，達 {call_line*100:.0f}% 須補繳"
 )
 
@@ -859,7 +860,7 @@ mc = pd.DataFrame({
 })
 show_df(mc)
 st.caption(
-    "使用率 ＝ 借款 ÷（擔保品市值 × LTV × 錯幣折扣 × 額度動用比例）。"
+    "使用率 ＝ 借款 ÷（擔保品市值 × LTV × 錯幣折扣）。"
     "　✅ 可跌 ≥25%　⚠️ 18–25%　❌ <18%　｜　參考：2022 年長天期投等債最大回檔逾 20%"
     + (f"　**已套用 {fx_pair} {fx_base:.2f} → {fx_now:.2f}**" if abs(fx_shock) > 1e-9 else "")
 )
@@ -963,7 +964,7 @@ st.subheader("⑤ 輸出 PDF 摘要")
 param_sig = (
     capital_source, principal, mortgage_amount, mortgage_rate,
     w_bond, yield_bond, yield_fund, ltv_bond, ltv_fund,
-    fx_discount, utilization, draw_ratio, last_draw_ratio,
+    fx_discount, draw_ratio, last_draw_ratio,
     lombard_rate, notice_line, call_line, extra_pledge,
     fx_pair, fx_base, fx_now, fx_step, fund_decline, stress_rate,
     tuple(layers_list),
@@ -987,7 +988,7 @@ else:
             w_bond=w_bond, w_fund=w_fund,
             yield_bond=yield_bond, yield_fund=yield_fund,
             ltv_bond=ltv_bond, ltv_fund=ltv_fund,
-            fx_discount=fx_discount, utilization=utilization,
+            fx_discount=fx_discount,
             lombard_rate=lombard_rate, blended_yield=blended_yield,
             credit_rate=credit_rate, draw_ratio=draw_ratio,
             last_draw_ratio=last_draw_ratio, extra_pledge=extra_pledge,
