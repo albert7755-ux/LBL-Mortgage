@@ -37,39 +37,37 @@ def credit_line_rate(w_bond, ltv_bond, w_fund, ltv_fund, fx_discount):
 def build_ladder(principal, rate, draw_ratios, layers, repledge=True):
     """
     層次化質借階梯
-      原始層  = 自有本金買入的債券（設質，尚未借款）
-      第 N 層 = 動用額度借出、買入債券
 
-    repledge=True  各層買入的債券再設質回擔保池 → 擔保品變大，可以繼續疊層
-    repledge=False 買入的債券留在非質押帳戶 → 擔保品固定，只能在原始額度內分次動用
+    動用比例的定義：**累計借款 = 該層動用當下的可動用額度 × 該層動用比例**
+    所以「各層都動用 80%」＝ 每一層都把累計借款維持在當時額度的 80%。
 
-    回傳 (逐層明細DF, 總部位, 總借款, 擔保品, 最後一次動用時的額度)
+    repledge=True  各層買入的債券再設質回擔保池 → 擔保品變大、額度變大，可繼續疊層
+    repledge=False 買入的債券留在非質押帳戶 → 擔保品與額度固定，累計借款不會再增加
+
+    回傳 (逐層明細DF, 總部位, 總借款, 已設質擔保品, 最後一次動用時的額度)
     """
     rows = [{"層次": "原始層", "動用時額度": principal * rate,
-             "本層借款": 0.0, "本層買入": principal,
-             "累計借款": 0.0, "累計部位": principal, "擔保品": principal}]
+             "本層借款": 0.0, "累計借款": 0.0,
+             "累計部位": principal, "擔保品": principal}]
 
-    collateral = principal      # 已設質的擔保品
-    position = principal        # 總持債（含未設質）
+    collateral = principal
+    position = principal
     borrow = 0.0
-    current = principal         # 上一層新增的擔保品
     limit_at_draw = principal * rate
 
     for i in range(1, layers + 1):
         limit_at_draw = collateral * rate
-        available = max(limit_at_draw - borrow, 0.0)
-        d = draw_ratios.get(i, 1.0)
-        borrowed = min(current * rate * d, available) if repledge else available * d
+        target = limit_at_draw * draw_ratios.get(i, 1.0)
+        delta = target - borrow          # 可能為負，代表還款
 
-        borrow += borrowed
-        position += borrowed
-        current = borrowed
+        borrow = target
+        position += delta
         if repledge:
-            collateral += borrowed
+            collateral += delta
 
         rows.append({"層次": LAYER_NAMES[i], "動用時額度": limit_at_draw,
-                     "本層借款": borrowed, "本層買入": borrowed,
-                     "累計借款": borrow, "累計部位": position, "擔保品": collateral})
+                     "本層借款": delta, "累計借款": borrow,
+                     "累計部位": position, "擔保品": collateral})
 
     return pd.DataFrame(rows), position, borrow, collateral, limit_at_draw
 
@@ -567,7 +565,11 @@ st.sidebar.caption(
 
 uniform_draw = st.sidebar.slider(
     "統一設定 (%)", 0, 100, 100, 5,
-    help="一次把所有層設成同一個比例",
+    help="累計借款佔該層動用當下可動用額度的比例",
+)
+st.sidebar.caption(
+    "動用比例 ＝ **累計借款 ÷ 該層動用當下的可動用額度**。"
+    "例如各層都設 80%，代表每一層都把累計借款維持在當時額度的 80%。"
 )
 per_layer_draw = st.sidebar.checkbox("各層分別設定", value=False)
 
@@ -575,7 +577,7 @@ draw_ratios = {}
 if per_layer_draw and max_layer > 0:
     for n in range(1, max_layer + 1):
         draw_ratios[n] = st.sidebar.slider(
-            f"{LAYER_NAMES[n]}動用 (%)", 0, 100, uniform_draw, 5,
+            f"{LAYER_NAMES[n]}累計動用 (%)", 0, 100, uniform_draw, 5,
             key=f"draw_{n}",
         ) / 100
 else:
@@ -671,8 +673,9 @@ with st.expander("🧮 公式拆解：算式怎麼跑的", expanded=False):
 **第二步｜你實際借多少**（側邊欄 4️⃣）
 
 ```
-每層借款 = 該層新增的可動用額度 × 該層動用比例
+累計借款 = 該層動用當下的可動用額度 × 該層動用比例
 各層設定：{draw_desc}
+（所以「各層都動用 80%」＝ 每層都把累計借款維持在當時額度的 80%）
 ```
 
 **第三步｜維持率（追繳判斷）**
@@ -807,7 +810,8 @@ st.subheader("① 部位結構")
 pos_df = pd.DataFrame({
     "層次": summary["層次"],
     "動用時可動用額度（萬）": summary["動用時額度"].map(fmt),
-    "本層借款（萬）": summary["本層借款"].map(fmt),
+    "本層新增借款（萬）": summary["本層借款"].map(
+        lambda x: fmt(x) if x >= 0 else f"{fmt(x)}（還款）"),
     "累計總借款（萬）": summary["總借款"].map(fmt),
     "已設質擔保品（萬）": summary["擔保品"].map(fmt),
     "總持債部位（萬）": summary["總部位"].map(fmt),
